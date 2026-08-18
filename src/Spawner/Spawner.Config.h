@@ -60,14 +60,14 @@ class SpawnerConfig
 		int SpawnLocations;
 		double CreditsFactor;
 		int HandicapDifficulty;
-		int Alliances[8];
+		int Alliances[16];
 
 		HouseConfig()
 			: IsObserver { false }
 			, SpawnLocations { -2 }
 			, CreditsFactor { 1.0 }
 			, HandicapDifficulty { -1 }
-			, Alliances { -1, -1, -1, -1, -1, -1, -1, -1 }
+			, Alliances { -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 }
 		{ }
 
 		void LoadFromINIFile(CCINIClass* pINI, int index);
@@ -132,10 +132,10 @@ public:
 	int  ListenPort;
 
 	// Players Options
-	PlayerConfig Players[8];
+	PlayerConfig Players[16];
 
 	// Houses Options
-	HouseConfig Houses[8];
+	HouseConfig Houses[16];
 
 	// Extended Options
 	bool Ra2Mode;
@@ -219,11 +219,31 @@ public:
 			PlayerConfig(),
 			PlayerConfig(),
 			PlayerConfig(),
+			PlayerConfig(),
+
+			PlayerConfig(),
+			PlayerConfig(),
+			PlayerConfig(),
+			PlayerConfig(),
+
+			PlayerConfig(),
+			PlayerConfig(),
+			PlayerConfig(),
 			PlayerConfig()
 		}
 
 		// Houses Options
 		, Houses {
+			HouseConfig(),
+			HouseConfig(),
+			HouseConfig(),
+			HouseConfig(),
+
+			HouseConfig(),
+			HouseConfig(),
+			HouseConfig(),
+			HouseConfig(),
+
 			HouseConfig(),
 			HouseConfig(),
 			HouseConfig(),

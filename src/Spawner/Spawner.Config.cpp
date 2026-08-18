@@ -124,7 +124,7 @@ void SpawnerConfig::LoadFromINIFile(CCINIClass* pINI)
 	}
 }
 
-const char* PlayerSectionArray[8] = {
+const char* PlayerSectionArray[16] = {
 	"Settings",
 	"Other1",
 	"Other2",
@@ -132,10 +132,18 @@ const char* PlayerSectionArray[8] = {
 	"Other4",
 	"Other5",
 	"Other6",
-	"Other7"
+	"Other7",
+	"Other8",
+	"Other9",
+	"Other10",
+	"Other11",
+	"Other12",
+	"Other13",
+	"Other14",
+	"Other15"
 };
 
-const char* MultiTagArray[8] = {
+const char* MultiTagArray[16] = {
 	"Multi1",
 	"Multi2",
 	"Multi3",
@@ -143,10 +151,18 @@ const char* MultiTagArray[8] = {
 	"Multi5",
 	"Multi6",
 	"Multi7",
-	"Multi8"
+	"Multi8",
+	"Multi9",
+	"Multi10",
+	"Multi11",
+	"Multi12",
+	"Multi13",
+	"Multi14",
+	"Multi15",
+	"Multi16"
 };
 
-const char* AlliancesSectionArray[8] = {
+const char* AlliancesSectionArray[16] = {
 	"Multi1_Alliances",
 	"Multi2_Alliances",
 	"Multi3_Alliances",
@@ -154,10 +170,18 @@ const char* AlliancesSectionArray[8] = {
 	"Multi5_Alliances",
 	"Multi6_Alliances",
 	"Multi7_Alliances",
-	"Multi8_Alliances"
+	"Multi8_Alliances",
+	"Multi9_Alliances",
+	"Multi10_Alliances",
+	"Multi11_Alliances",
+	"Multi12_Alliances",
+	"Multi13_Alliances",
+	"Multi14_Alliances",
+	"Multi15_Alliances",
+	"Multi16_Alliances"
 };
 
-const char* AlliancesTagArray[8] = {
+const char* AlliancesTagArray[16] = {
 	"HouseAllyOne",
 	"HouseAllyTwo",
 	"HouseAllyThree",
@@ -165,12 +189,20 @@ const char* AlliancesTagArray[8] = {
 	"HouseAllyFive",
 	"HouseAllySix",
 	"HouseAllySeven",
-	"HouseAllyEight"
+	"HouseAllyEight",
+	"HouseAllyNine",
+	"HouseAllyTen",
+	"HouseAllyEleven",
+	"HouseAllyTwelve",
+	"HouseAllyThirteen",
+	"HouseAllyFourteen",
+	"HouseAllyFifteen",
+	"HouseAllySixteen"
 };
 
 void SpawnerConfig::PlayerConfig::LoadFromINIFile(CCINIClass* pINI, int index)
 {
-	if (!pINI || index >= 8)
+	if (!pINI || index >= 16)
 		return;
 
 	const char* pSection = PlayerSectionArray[index];
@@ -201,7 +233,7 @@ void SpawnerConfig::PlayerConfig::LoadFromINIFile(CCINIClass* pINI, int index)
 
 void SpawnerConfig::HouseConfig::LoadFromINIFile(CCINIClass* pINI, int index)
 {
-	if (!pINI || index >= 8)
+	if (!pINI || index >= 16)
 		return;
 
 	const char* pAlliancesSection = AlliancesSectionArray[index];
@@ -214,7 +246,7 @@ void SpawnerConfig::HouseConfig::LoadFromINIFile(CCINIClass* pINI, int index)
 
 	if (pINI->GetSection(pAlliancesSection))
 	{
-		for (int i = 0; i < 8; i++)
+		for (int i = 0; i < 16; i++)
 			this->Alliances[i] = pINI->ReadInteger(pAlliancesSection, AlliancesTagArray[i], this->Alliances[i]);
 	}
 }

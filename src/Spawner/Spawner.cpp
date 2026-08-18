@@ -143,7 +143,7 @@ void Spawner::AssignHouses()
 		{
 			pHouse->StartingPoint = (nSpawnLocations < 0)
 				? -2
-				: std::clamp(nSpawnLocations, 0, 7);
+				: std::clamp(nSpawnLocations, 0, 15);
 		}
 		else
 		{
@@ -363,6 +363,14 @@ bool Spawner::StartScenario(const char* pScenarioName)
 			Game::ChatMask[5] = false;
 			Game::ChatMask[6] = false;
 			Game::ChatMask[7] = false;
+			Game::ChatMask[8] = false;
+			Game::ChatMask[9] = false;
+			Game::ChatMask[10] = false;
+			Game::ChatMask[11] = false;
+			Game::ChatMask[12] = false;
+			Game::ChatMask[13] = false;
+			Game::ChatMask[14] = false;
+			Game::ChatMask[15] = false;
 		}
 
 		return true;
