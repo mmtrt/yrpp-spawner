@@ -1,0 +1,706 @@
+/*
+ * PlayerLimit16.cpp – yrpp-spawner port of working 16player.dll
+ *
+ * Phase B2-batch+restore:
+ *  - House array expand to 16
+ *  - AI create loop: after first 8-slot pass, refill AISlots for missing AI
+ *  - Save/restore originals across second AssignHouses
+ *  - Waypoint table rewrite (cell values → house indices)
+ *  - Score screen: cap filled rows at 8 (stock 0xA8D1FC array) to stop
+ *    end-game AV at 0x5C9917 when House count > 8
+ *
+ * Drop standalone 16player.dll from Syringe inject list after integrating.
+ */
+
+#include "PlayerLimit16.h"
+
+#include <Utilities/Macro.h>
+#include <Helpers/Macro.h>
+
+#include <HouseClass.h>
+#include <HouseTypeClass.h>
+#include <ScenarioClass.h>
+
+#include <cstdio>
+#include <cstdarg>
+#include <cstring>
+
+// ---------------------------------------------------------------------------
+// Addresses (YR 1.001 / gamemd). Prefer YRpp globals when available.
+// ---------------------------------------------------------------------------
+
+// File-scope aliases (MSVC needs these in free functions; class statics alone are not enough)
+static constexpr int MaxPlayers = PlayerLimit16::MaxPlayers;
+static constexpr int EngineAISlots = PlayerLimit16::EngineAISlots;
+
+static constexpr DWORD ADDR_HOUSE_PTR   = 0x00A8022C; // HouseClass::Array items ptr
+static constexpr DWORD ADDR_HOUSE_CAP   = 0x00A80230; // capacity
+static constexpr DWORD ADDR_HOUSE_COUNT = 0x00A80238; // count
+static constexpr DWORD ADDR_HOUSE_ALLOC = 0x00A80234; // IsAllocated (bool)
+static constexpr DWORD ADDR_CUR_HOUSE   = 0x00A8B23C;
+static constexpr DWORD ADDR_MAP         = 0x00A8B230; // ScenarioClass*
+static constexpr DWORD ADDR_GMO         = 0x00A8B250; // GameModeOptionsClass*
+
+static constexpr DWORD OFF_GMO_AIPLAYERS = 0x24;
+
+// GameModeOptions AISlots parallel arrays (8 ints each, engine layout)
+static constexpr DWORD ADDR_AIS_DIFF    = 0x00A8B27C;
+static constexpr DWORD ADDR_AIS_COUNTRY = 0x00A8B29C;
+static constexpr DWORD ADDR_AIS_COLOR   = 0x00A8B2BC;
+static constexpr DWORD ADDR_AIS_START   = 0x00A8B2DC;
+static constexpr DWORD ADDR_AIS_TEAM    = 0x00A8B2FC;
+static constexpr DWORD ADDR_AIS_END     = 0x00A8B2BC; // end of Country[] scan
+
+static constexpr DWORD ADDR_HTYPE_PTR   = 0x00A83C9C;
+static constexpr DWORD ADDR_HTYPE_CNT   = 0x00A83CA8;
+
+// Map / Scenario waypoint house-index table offset
+static constexpr DWORD OFF_WP_HOUSE_TABLE = 0x1180;
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+
+static HouseClass* g_HouseArray16[PlayerLimit16::MaxPlayers] {};
+static bool g_HouseExpanded = false;
+static int  g_LastCount = -1;
+static bool g_ForceEnabled = false;
+static bool g_BatchDone = false;
+static bool g_HaveOrig = false;
+static bool g_LoggedSlots = false;
+static bool g_WpTableDumped = false;
+static bool g_UsingEngineBuffer = false;
+
+static int g_TplCountry[8], g_TplColor[8], g_TplDiff[8], g_TplStart[8], g_TplTeam[8];
+static int g_TplCount = 0;
+
+static int g_OrigCountry[8], g_OrigColor[8], g_OrigDiff[8], g_OrigStart[8], g_OrigTeam[8];
+
+static FILE* g_Log = nullptr;
+
+// ---------------------------------------------------------------------------
+// Logging (optional – remove or wire to Debug::Log)
+// ---------------------------------------------------------------------------
+
+static void LogInit()
+{
+	if (g_Log)
+		return;
+	g_Log = fopen("playerlimit16.log", "a");
+	if (g_Log)
+	{
+		fprintf(g_Log, "\n========== PlayerLimit16 loaded ==========\n");
+		fflush(g_Log);
+	}
+}
+
+static void Log(const char* fmt, ...)
+{
+	if (!g_Log)
+		LogInit();
+	if (!g_Log)
+		return;
+	va_list args;
+	va_start(args, fmt);
+	vfprintf(g_Log, fmt, args);
+	va_end(args);
+	fflush(g_Log);
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+static bool IsPlausiblePtr(DWORD p)
+{
+	return p >= 0x01000000 && p < 0x7FFF0000;
+}
+
+static bool IsPlausibleVTable(DWORD vt)
+{
+	return vt >= 0x00400000 && vt < 0x00A00000;
+}
+
+static bool IsValidHouse(DWORD house)
+{
+	if (!IsPlausiblePtr(house))
+		return false;
+	return IsPlausibleVTable(*reinterpret_cast<DWORD*>(house));
+}
+
+static int GetAIPlayers()
+{
+	int n = *reinterpret_cast<int*>(ADDR_GMO + OFF_GMO_AIPLAYERS);
+	if (n < 0)
+		n = 0;
+	if (n > 15)
+		n = 15;
+	return n;
+}
+
+bool PlayerLimit16::IsActive()
+{
+	if (g_ForceEnabled)
+		return true;
+	return GetAIPlayers() > 7;
+}
+
+void PlayerLimit16::SetForceEnabled(bool enabled)
+{
+	g_ForceEnabled = enabled;
+}
+
+// ---------------------------------------------------------------------------
+// House array expand
+// ---------------------------------------------------------------------------
+
+void PlayerLimit16::ExpandHouseArray(const char* caller)
+{
+	if (!caller)
+		caller = "?";
+
+	DWORD* cur = *reinterpret_cast<DWORD**>(ADDR_HOUSE_PTR);
+	int count = *reinterpret_cast<int*>(ADDR_HOUSE_COUNT);
+	if (count < 0)
+		count = 0;
+	if (count > MaxPlayers)
+		count = MaxPlayers;
+
+	if (!g_HouseExpanded)
+	{
+		if (!cur)
+		{
+			Log("[Expand] %s: pointer still NULL – waiting\n", caller);
+			return;
+		}
+		for (int i = 0; i < count; i++)
+			g_HouseArray16[i] = reinterpret_cast<HouseClass*>(cur[i]);
+		for (int i = count; i < MaxPlayers; i++)
+			g_HouseArray16[i] = nullptr;
+
+		*reinterpret_cast<DWORD**>(ADDR_HOUSE_PTR) = reinterpret_cast<DWORD*>(g_HouseArray16);
+		*reinterpret_cast<DWORD*>(ADDR_HOUSE_CAP) = MaxPlayers;
+		*reinterpret_cast<BYTE*>(ADDR_HOUSE_ALLOC) = 0; // do not free static buffer
+		g_HouseExpanded = true;
+		g_LastCount = count;
+		Log("[Expand] %s: FIRST – Count=%d Cap=%d ptr=%p\n",
+			caller, count, MaxPlayers, static_cast<void*>(g_HouseArray16));
+		return;
+	}
+
+	if (g_UsingEngineBuffer)
+	{
+		/* Engine owns a Cap>=16 buffer – do not touch Count or Items */
+		return;
+	}
+
+	if (cur != reinterpret_cast<DWORD*>(g_HouseArray16))
+	{
+		DWORD engCap = *reinterpret_cast<DWORD*>(ADDR_HOUSE_CAP);
+		Log("[Expand] %s: pointer now %p engCap=%u count=%d\n",
+			caller, static_cast<void*>(cur), engCap, count);
+
+		if (cur && engCap >= static_cast<DWORD>(MaxPlayers))
+		{
+			/* One-time adopt: mirror for our redirects, then leave engine alone */
+			for (int i = 0; i < MaxPlayers; i++)
+			{
+				DWORD h = (i < count) ? cur[i] : 0;
+				g_HouseArray16[i] = reinterpret_cast<HouseClass*>(h);
+			}
+			g_UsingEngineBuffer = true;
+			g_LastCount = count;
+			Log("[Expand] adopted engine buffer Cap=%u Count=%d – no further reclaim\n",
+				engCap, count);
+			return;
+		}
+
+		/* Engine buffer too small – keep static */
+		if (cur)
+		{
+			for (int i = 0; i < count && i < MaxPlayers; i++)
+				g_HouseArray16[i] = reinterpret_cast<HouseClass*>(cur[i]);
+			for (int i = count; i < MaxPlayers; i++)
+				g_HouseArray16[i] = nullptr;
+		}
+		*reinterpret_cast<DWORD**>(ADDR_HOUSE_PTR) = reinterpret_cast<DWORD*>(g_HouseArray16);
+		*reinterpret_cast<DWORD*>(ADDR_HOUSE_CAP) = MaxPlayers;
+		*reinterpret_cast<BYTE*>(ADDR_HOUSE_ALLOC) = 0;
+	}
+	else
+	{
+		*reinterpret_cast<DWORD*>(ADDR_HOUSE_CAP) = MaxPlayers;
+		*reinterpret_cast<BYTE*>(ADDR_HOUSE_ALLOC) = 0;
+	}
+
+	if (count != g_LastCount)
+	{
+		Log("[Expand] %s: Count %d → %d\n", caller, g_LastCount, count);
+		if (count < g_LastCount)
+		{
+			g_BatchDone = false;
+			g_TplCount = 0;
+			g_WpTableDumped = false;
+			g_UsingEngineBuffer = false;
+			Log("[Expand] Count dropped – batch state reset\n");
+		}
+		g_LastCount = count;
+	}
+}
+
+// ---------------------------------------------------------------------------
+// AISlots save / restore / batch refill
+// ---------------------------------------------------------------------------
+
+static void SaveOriginals()
+{
+	if (g_HaveOrig)
+		return;
+	int* eCountry = reinterpret_cast<int*>(ADDR_AIS_COUNTRY);
+	int* eColor = reinterpret_cast<int*>(ADDR_AIS_COLOR);
+	int* eDiff = reinterpret_cast<int*>(ADDR_AIS_DIFF);
+	int* eStart = reinterpret_cast<int*>(ADDR_AIS_START);
+	int* eTeam = reinterpret_cast<int*>(ADDR_AIS_TEAM);
+	for (int i = 0; i < EngineAISlots; i++)
+	{
+		g_OrigCountry[i] = eCountry[i];
+		g_OrigColor[i] = eColor[i];
+		g_OrigDiff[i] = eDiff[i];
+		g_OrigStart[i] = eStart[i];
+		g_OrigTeam[i] = eTeam[i];
+	}
+	g_HaveOrig = true;
+	Log("[Batch] saved original AISlots\n");
+}
+
+static void RestoreOriginals()
+{
+	if (!g_HaveOrig)
+		return;
+	int* eCountry = reinterpret_cast<int*>(ADDR_AIS_COUNTRY);
+	int* eColor = reinterpret_cast<int*>(ADDR_AIS_COLOR);
+	int* eDiff = reinterpret_cast<int*>(ADDR_AIS_DIFF);
+	int* eStart = reinterpret_cast<int*>(ADDR_AIS_START);
+	int* eTeam = reinterpret_cast<int*>(ADDR_AIS_TEAM);
+	for (int i = 0; i < EngineAISlots; i++)
+	{
+		eCountry[i] = g_OrigCountry[i];
+		eColor[i] = g_OrigColor[i];
+		eDiff[i] = g_OrigDiff[i];
+		eStart[i] = g_OrigStart[i];
+		eTeam[i] = g_OrigTeam[i];
+	}
+	Log("[Batch] restored original AISlots\n");
+}
+
+static void CaptureTemplates()
+{
+	if (g_TplCount > 0)
+		return;
+
+	int htCount = *reinterpret_cast<int*>(ADDR_HTYPE_CNT);
+	DWORD* htArr = *reinterpret_cast<DWORD**>(ADDR_HTYPE_PTR);
+
+	const int* srcCountry = g_HaveOrig ? g_OrigCountry : reinterpret_cast<int*>(ADDR_AIS_COUNTRY);
+	const int* srcColor = g_HaveOrig ? g_OrigColor : reinterpret_cast<int*>(ADDR_AIS_COLOR);
+	const int* srcDiff = g_HaveOrig ? g_OrigDiff : reinterpret_cast<int*>(ADDR_AIS_DIFF);
+	const int* srcStart = g_HaveOrig ? g_OrigStart : reinterpret_cast<int*>(ADDR_AIS_START);
+	const int* srcTeam = g_HaveOrig ? g_OrigTeam : reinterpret_cast<int*>(ADDR_AIS_TEAM);
+
+	for (int i = 0; i < EngineAISlots; i++)
+	{
+		int c = srcCountry[i];
+		if (c < 0 || c >= htCount)
+			continue;
+		if (!htArr || !IsPlausiblePtr(htArr[c]))
+			continue;
+		g_TplCountry[g_TplCount] = c;
+		g_TplColor[g_TplCount] = srcColor[i];
+		g_TplDiff[g_TplCount] = srcDiff[i];
+		g_TplStart[g_TplCount] = srcStart[i];
+		g_TplTeam[g_TplCount] = srcTeam[i];
+		g_TplCount++;
+	}
+	Log("[Batch] captured %d AI templates\n", g_TplCount);
+}
+
+static void RefillEngineSlots(int need)
+{
+	int* eCountry = reinterpret_cast<int*>(ADDR_AIS_COUNTRY);
+	int* eColor = reinterpret_cast<int*>(ADDR_AIS_COLOR);
+	int* eDiff = reinterpret_cast<int*>(ADDR_AIS_DIFF);
+	int* eStart = reinterpret_cast<int*>(ADDR_AIS_START);
+	int* eTeam = reinterpret_cast<int*>(ADDR_AIS_TEAM);
+
+	if (g_TplCount <= 0)
+	{
+		Log("[Batch] no templates – cannot refill\n");
+		return;
+	}
+	if (need > EngineAISlots)
+		need = EngineAISlots;
+	if (need < 0)
+		need = 0;
+
+	for (int i = 0; i < need; i++)
+	{
+		int t = i % g_TplCount;
+		eCountry[i] = g_TplCountry[t];
+		eColor[i] = (g_TplColor[t] + 8 + i) & 15;
+		eDiff[i] = g_TplDiff[t];
+		// Keep starts in 0..7 so parallel assign path never OOB
+		eStart[i] = (g_TplStart[t] >= 0) ? ((g_TplStart[t] + i) % 8) : (i % 8);
+		eTeam[i] = g_TplTeam[t];
+		Log("[Batch] refill slot %d country=%d color=%d start=%d\n",
+			i, eCountry[i], eColor[i], eStart[i]);
+	}
+	for (int i = need; i < EngineAISlots; i++)
+	{
+		eCountry[i] = -1;
+		eColor[i] = -1;
+		eStart[i] = -1;
+		eTeam[i] = -1;
+	}
+}
+
+static void LogAISlotsAndTypes()
+{
+	if (g_LoggedSlots)
+		return;
+	g_LoggedSlots = true;
+
+	int aiPlayers = GetAIPlayers();
+	int aiDiff = *reinterpret_cast<int*>(ADDR_GMO + 0x28);
+	int htCount = *reinterpret_cast<int*>(ADDR_HTYPE_CNT);
+	DWORD* htPtr = *reinterpret_cast<DWORD**>(ADDR_HTYPE_PTR);
+
+	Log("[GMO] AIPlayers=%d AIDifficulty=%d HouseTypeCount=%d\n",
+		aiPlayers, aiDiff, htCount);
+
+	int* eCountry = reinterpret_cast<int*>(ADDR_AIS_COUNTRY);
+	int* eColor = reinterpret_cast<int*>(ADDR_AIS_COLOR);
+	int* eDiffA = reinterpret_cast<int*>(ADDR_AIS_DIFF);
+	int* eStart = reinterpret_cast<int*>(ADDR_AIS_START);
+
+	for (int i = 0; i < EngineAISlots; i++)
+	{
+		int c = eCountry[i];
+		bool ok = (c >= 0 && c < htCount && htPtr && IsPlausiblePtr(htPtr[c]));
+		Log("[AISlots] %d country=%d color=%d diff=%d start=%d htype_ok=%d\n",
+			i, c, eColor[i], eDiffA[i], eStart[i], static_cast<int>(ok));
+	}
+}
+
+static void DumpWaypointTable()
+{
+	if (g_WpTableDumped)
+		return;
+	g_WpTableDumped = true;
+	DWORD map = *reinterpret_cast<DWORD*>(ADDR_MAP);
+	if (!IsPlausiblePtr(map))
+	{
+		Log("[Waypoint] Map pointer invalid (%08X)\n", map);
+		return;
+	}
+	int* table = reinterpret_cast<int*>(map + OFF_WP_HOUSE_TABLE);
+	Log("[Waypoint] house-index table @ %p:", static_cast<void*>(table));
+	for (int i = 0; i < MaxPlayers; i++)
+		Log(" [%d]=%d", i, table[i]);
+	Log("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Hooks – house array
+// ---------------------------------------------------------------------------
+
+DEFINE_HOOK(0x5EEA19, PlayerLimit16_HouseArray_Loop, 6)
+{
+	if (!PlayerLimit16::IsActive())
+		return 0;
+	PlayerLimit16::ExpandHouseArray("Loop");
+	if (g_UsingEngineBuffer)
+		return 0; /* engine ptr already correct */
+		R->EDX(reinterpret_cast<DWORD>(g_HouseArray16));
+	return 0x5EEA1F;
+}
+
+DEFINE_HOOK(0x640F46, PlayerLimit16_HouseArray_640F, 6)
+{
+	if (!PlayerLimit16::IsActive())
+		return 0;
+	PlayerLimit16::ExpandHouseArray("640F");
+
+	/* EDX = house index from map; OOB caused AV at house+0x16054 with 16 players */
+	DWORD idx = R->EDX();
+	DWORD* arr = *reinterpret_cast<DWORD**>(ADDR_HOUSE_PTR);
+	int count = *reinterpret_cast<int*>(ADDR_HOUSE_COUNT);
+	if (!arr)
+		arr = reinterpret_cast<DWORD*>(g_HouseArray16);
+	if (count < 0)
+		count = 0;
+	if (count > MaxPlayers)
+		count = MaxPlayers;
+
+	if (idx >= static_cast<DWORD>(count) || !arr[idx])
+	{
+		Log("[640F] skip bad idx=%u count=%d\n", idx, count);
+		return 0x641055; /* original je not-found path */
+	}
+
+	R->EBP(reinterpret_cast<DWORD>(arr));
+	return 0x640F4C;
+}
+
+DEFINE_HOOK(0x4F61E6, PlayerLimit16_HouseArray_Create, 6)
+{
+	if (!PlayerLimit16::IsActive())
+		return 0;
+	PlayerLimit16::ExpandHouseArray("Create");
+	LogAISlotsAndTypes();
+	if (g_UsingEngineBuffer)
+		return 0;
+	R->ECX(reinterpret_cast<DWORD>(g_HouseArray16));
+	return 0x4F61EC;
+}
+
+DEFINE_HOOK(0x687572, PlayerLimit16_NullCheck_CurrentHouse, 6)
+{
+	if (!PlayerLimit16::IsActive())
+		return 0;
+	PlayerLimit16::ExpandHouseArray("NullCheck");
+	DWORD housePtr = *reinterpret_cast<DWORD*>(ADDR_CUR_HOUSE);
+	if (!IsValidHouse(housePtr))
+	{
+		Log("[NullCheck] reject house %08X – skip\n", housePtr);
+		return 0x687581;
+	}
+	R->ECX(housePtr);
+	return 0;
+}
+
+DEFINE_HOOK(0x4F6032, PlayerLimit16_CreatePath_Redirect, 5)
+{
+	if (!PlayerLimit16::IsActive())
+		return 0;
+	PlayerLimit16::ExpandHouseArray("CreatePath");
+	if (g_UsingEngineBuffer)
+		return 0;
+	R->EAX(reinterpret_cast<DWORD>(g_HouseArray16));
+	return 0x4F6037;
+}
+
+DEFINE_HOOK(0x650B5A, PlayerLimit16_Hot_650B_Redirect, 5)
+{
+	if (!PlayerLimit16::IsActive())
+		return 0;
+	PlayerLimit16::ExpandHouseArray("Hot650B");
+	if (g_UsingEngineBuffer)
+		return 0;
+	R->EAX(reinterpret_cast<DWORD>(g_HouseArray16));
+	return 0x650B5F;
+}
+
+DEFINE_HOOK(0x686A2E, PlayerLimit16_Hot_686A_Redirect, 5)
+{
+	if (!PlayerLimit16::IsActive())
+		return 0;
+	PlayerLimit16::ExpandHouseArray("Hot686A");
+	if (g_UsingEngineBuffer)
+		return 0;
+	R->EAX(reinterpret_cast<DWORD>(g_HouseArray16));
+	return 0x686A33;
+}
+
+// ---------------------------------------------------------------------------
+// Hooks – waypoint
+// ---------------------------------------------------------------------------
+
+DEFINE_HOOK(0x5D6CBF, PlayerLimit16_Waypoint_HouseLoad, 6)
+{
+	if (!PlayerLimit16::IsActive())
+		return 0;
+
+	PlayerLimit16::ExpandHouseArray("Waypoint");
+	DWORD* live = *reinterpret_cast<DWORD**>(ADDR_HOUSE_PTR);
+	if (!live)
+		live = reinterpret_cast<DWORD*>(g_HouseArray16);
+	R->EDX(reinterpret_cast<DWORD>(live));
+
+	DWORD idx = R->ESI();
+	if (idx >= MaxPlayers) {
+		Log("[Waypoint] idx %u out of range – skip\n", idx);
+		return 0x5D6D3F;
+	}
+
+	// Once per pass: if table holds cells instead of house indices, rewrite
+	if (idx == 0)
+	{
+		DWORD map = *reinterpret_cast<DWORD*>(ADDR_MAP);
+		if (IsPlausiblePtr(map))
+		{
+			DWORD* table = reinterpret_cast<DWORD*>(map + OFF_WP_HOUSE_TABLE);
+			int count = *reinterpret_cast<int*>(ADDR_HOUSE_COUNT);
+			if (count > MaxPlayers)
+				count = MaxPlayers;
+			if (count < 0)
+				count = 0;
+
+			if (table[0] > 16)
+			{
+				Log("[Waypoint] rewriting cell-table → house indices (count=%d)\n", count);
+				for (int i = 0; i < count; i++)
+					table[i] = static_cast<DWORD>(i);
+				for (int i = count; i < MaxPlayers; i++)
+					table[i] = 0xFFFFFFFFu;
+			}
+		}
+		g_WpTableDumped = false;
+		DumpWaypointTable();
+	}
+
+	DWORD house = (idx < MaxPlayers) ? live[idx] : 0;
+	/* Null only – strict vtable checks rejected valid Ares/Phobos houses */
+	if (!house)
+	{
+		Log("[Waypoint] idx %u null house – skip body\n", idx);
+		return 0x5D6D3F;
+	}
+	return 0x5D6CC5;
+}
+
+DEFINE_HOOK(0x5D6D02, PlayerLimit16_Waypoint_NotFoundSkip, 5)
+{
+	if (!PlayerLimit16::IsActive())
+		return 0;
+	Log("[Waypoint] idx %u – not-found, skip\n", R->ESI());
+	return 0x5D6D3F;
+}
+
+// ---------------------------------------------------------------------------
+// Hooks – AI create batch
+// ---------------------------------------------------------------------------
+
+
+/*
+ * HouseClass::Array clear loop destroys Items[0] repeatedly.
+ * Guard: skip entries with null/invalid vtable to avoid AV at [edx+0x20].
+ */
+/* HouseClear_Guard removed – size-5 on mov eax,[imm] was optional and risky */
+
+
+DEFINE_HOOK(0x688158, PlayerLimit16_AICreate_LoopStart, 5)
+{
+	if (!PlayerLimit16::IsActive())
+		return 0;
+
+	if (g_HaveOrig)
+	{
+		RestoreOriginals();
+		g_BatchDone = false;
+		g_TplCount = 0;
+	}
+	else
+	{
+		SaveOriginals();
+	}
+	R->EBX(ADDR_AIS_COUNTRY);
+	return 0x68815D;
+}
+
+DEFINE_HOOK(0x6882C5, PlayerLimit16_AICreate_EndBound, 6)
+{
+	if (!PlayerLimit16::IsActive())
+		return 0;
+
+	DWORD ebx = R->EBX();
+	int created = static_cast<int>(R->EAX());
+	int aiPlayers = GetAIPlayers();
+
+	if (ebx < ADDR_AIS_END)
+		return 0x68815D;
+
+	CaptureTemplates();
+
+	int need = aiPlayers - created;
+	if (need > 0 && !g_BatchDone && g_TplCount > 0)
+	{
+		g_BatchDone = true;
+		if (need > EngineAISlots)
+			need = EngineAISlots;
+		Log("[Batch] first pass done created=%d AIPlayers=%d need=%d – refill & restart\n",
+			created, aiPlayers, need);
+		RefillEngineSlots(need);
+		R->EBX(ADDR_AIS_COUNTRY);
+		return 0x68815D;
+	}
+
+	Log("[Batch] loop complete created=%d AIPlayers=%d Count=%d\n",
+		created, aiPlayers, *reinterpret_cast<int*>(ADDR_HOUSE_COUNT));
+	return 0x6882D1;
+}
+
+// ---------------------------------------------------------------------------
+// Hooks – end-game score screen (stock array is 8 × 0x70 at 0xA8D1FC)
+//
+// gamemd 0x5C98A0 walks HouseClass::Array.Count with no slot cap and writes
+// score entries at 0xA8D1FC + slot*0x70. With 16 houses, slots 8+ overrun
+// BSS → AV at 0x5C9917 (mov [esi+0xA8D228], 0). Cap at 8 so the match can
+// exit; full 16-row score needs reallocated storage later.
+// ---------------------------------------------------------------------------
+
+static constexpr DWORD ADDR_SCORE_SLOT_COUNT = 0x00A8D580;
+static constexpr int   SCORE_SLOT_MAX        = 8; // stock score UI capacity
+
+/*
+ * 0x5C98F1: mov eax, [0xA8D580]  (5 bytes)
+ * When already 8 score rows filled, skip this house (same as null/spectator path).
+ */
+DEFINE_HOOK(0x5C98F1, PlayerLimit16_ScoreSlotCap, 5)
+{
+	if (!PlayerLimit16::IsActive())
+		return 0;
+
+	DWORD slots = *reinterpret_cast<DWORD*>(ADDR_SCORE_SLOT_COUNT);
+	if (slots >= static_cast<DWORD>(SCORE_SLOT_MAX))
+	{
+		Log("[Score] slot full (%u) – skip further score rows\n", slots);
+		return 0x5C9A7E; /* loop tail: next house index */
+	}
+	return 0;
+}
+
+/*
+ * 0x5C9AA1: mov esi, [0xA8D580]  (6 bytes) — after push esi at 0x5C9AA0.
+ * Clamp count so pointer fill does not walk past 8 reserved entries.
+ */
+DEFINE_HOOK(0x5C9AA1, PlayerLimit16_ScorePtrTableCap, 6)
+{
+	if (!PlayerLimit16::IsActive())
+		return 0;
+
+	DWORD* pCount = reinterpret_cast<DWORD*>(ADDR_SCORE_SLOT_COUNT);
+	if (*pCount > static_cast<DWORD>(SCORE_SLOT_MAX))
+	{
+		Log("[Score] clamp ptr-table count %u → %d\n", *pCount, SCORE_SLOT_MAX);
+		*pCount = static_cast<DWORD>(SCORE_SLOT_MAX);
+	}
+	return 0;
+}
+
+/*
+ * 0x5C9D47: second path that rebuilds the same pointer table (post-sort UI).
+ * Bytes: 8B 2D 80 D5 A8 00  (mov ebp, [0xA8D580]) — length 6.
+ */
+DEFINE_HOOK(0x5C9D47, PlayerLimit16_ScorePtrTableCap2, 6)
+{
+	if (!PlayerLimit16::IsActive())
+		return 0;
+
+	DWORD* pCount = reinterpret_cast<DWORD*>(ADDR_SCORE_SLOT_COUNT);
+	if (*pCount > static_cast<DWORD>(SCORE_SLOT_MAX))
+	{
+		Log("[Score] clamp ptr-table2 count %u → %d\n", *pCount, SCORE_SLOT_MAX);
+		*pCount = static_cast<DWORD>(SCORE_SLOT_MAX);
+	}
+	return 0;
+}
