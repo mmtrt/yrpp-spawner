@@ -25,6 +25,7 @@
 #include <cstdarg>
 #include <cstring>
 #include <cstdlib>
+#include <Windows.h>
 
 // ---------------------------------------------------------------------------
 // Addresses (YR 1.001 / gamemd). Prefer YRpp globals when available.
@@ -667,6 +668,8 @@ static constexpr int   SCORE_SLOT_MAX        = 16; // expanded
 alignas(16) static uint8_t  g_ScoreEntries[SCORE_SLOT_MAX * SCORE_ENTRY_STRIDE] {};
 static uint32_t             g_ScorePtrs[SCORE_SLOT_MAX] {};
 static bool                 g_ScoreBufLogged = false;
+static int                  g_ScoreScroll = 0;          /* first visible row */
+static constexpr int        SCORE_VISIBLE_ROWS = 8;    /* stock panel height */
 
 static DWORD ScoreEntryDelta()
 {
@@ -767,8 +770,19 @@ static void ScoreRebuildPtrTable()
 	if (count > 1)
 		qsort(g_ScorePtrs, count, sizeof(DWORD), ScoreEntryCompar);
 
-	Log("[Score] rebuild ptrs count=%u first=%08X\n",
-		count, count ? g_ScorePtrs[0] : 0);
+	/* keep scroll in range after rebuild/sort */
+	{
+		int maxScroll = static_cast<int>(count) - SCORE_VISIBLE_ROWS;
+		if (maxScroll < 0)
+			maxScroll = 0;
+		if (g_ScoreScroll > maxScroll)
+			g_ScoreScroll = maxScroll;
+		if (g_ScoreScroll < 0)
+			g_ScoreScroll = 0;
+	}
+
+	Log("[Score] rebuild ptrs count=%u first=%08X scroll=%d\n",
+		count, count ? g_ScorePtrs[0] : 0, g_ScoreScroll);
 }
 
 /* 0x5C9AA0: entire rebuild function → ret at 0x5C9ADD */
@@ -793,16 +807,23 @@ DEFINE_HOOK(0x5C9D47, PlayerLimit16_Score_PtrRebuild2, 6)
 	return 0x5C9D82;
 }
 
+
+static DWORD ScoreDrawIndex(DWORD row)
+{
+	const DWORD count = *reinterpret_cast<DWORD*>(ADDR_SCORE_SLOT_COUNT);
+	DWORD idx = row + static_cast<DWORD>(g_ScoreScroll);
+	if (idx >= count || idx >= static_cast<DWORD>(SCORE_SLOT_MAX))
+		idx = 0;
+	return idx;
+}
+
 /* ---- draw path: mov reg, [index*4 + 0xABF958] (7 bytes) ---- */
 
 DEFINE_HOOK(0x5C9DF4, PlayerLimit16_Score_DrawPtr_EDX, 7)
 {
 	if (!PlayerLimit16::IsActive())
 		return 0;
-	DWORD idx = R->ECX();
-	if (idx >= static_cast<DWORD>(SCORE_SLOT_MAX))
-		idx = 0;
-	R->EDX(g_ScorePtrs[idx]);
+	R->EDX(g_ScorePtrs[ScoreDrawIndex(R->ECX())]);
 	return 0x5C9DFB;
 }
 
@@ -810,10 +831,7 @@ DEFINE_HOOK(0x5C9E8A, PlayerLimit16_Score_DrawPtr_ECX_a, 7)
 {
 	if (!PlayerLimit16::IsActive())
 		return 0;
-	DWORD idx = R->EDX();
-	if (idx >= static_cast<DWORD>(SCORE_SLOT_MAX))
-		idx = 0;
-	R->ECX(g_ScorePtrs[idx]);
+	R->ECX(g_ScorePtrs[ScoreDrawIndex(R->EDX())]);
 	return 0x5C9E91;
 }
 
@@ -821,11 +839,7 @@ DEFINE_HOOK(0x5C9EC9, PlayerLimit16_Score_DrawPtr_ECX_b, 7)
 {
 	if (!PlayerLimit16::IsActive())
 		return 0;
-	/* 8B 0C 85 58 F9 AB 00  — mov ecx, [eax*4+0xABF958] */
-	DWORD idx = R->EAX();
-	if (idx >= static_cast<DWORD>(SCORE_SLOT_MAX))
-		idx = 0;
-	R->ECX(g_ScorePtrs[idx]);
+	R->ECX(g_ScorePtrs[ScoreDrawIndex(R->EAX())]);
 	return 0x5C9ED0;
 }
 
@@ -833,10 +847,7 @@ DEFINE_HOOK(0x5C9F25, PlayerLimit16_Score_DrawPtr_ECX_c, 7)
 {
 	if (!PlayerLimit16::IsActive())
 		return 0;
-	DWORD idx = R->EAX();
-	if (idx >= static_cast<DWORD>(SCORE_SLOT_MAX))
-		idx = 0;
-	R->ECX(g_ScorePtrs[idx]);
+	R->ECX(g_ScorePtrs[ScoreDrawIndex(R->EAX())]);
 	return 0x5C9F2C;
 }
 
@@ -844,10 +855,7 @@ DEFINE_HOOK(0x5C9F81, PlayerLimit16_Score_DrawPtr_ECX_d, 7)
 {
 	if (!PlayerLimit16::IsActive())
 		return 0;
-	DWORD idx = R->EAX();
-	if (idx >= static_cast<DWORD>(SCORE_SLOT_MAX))
-		idx = 0;
-	R->ECX(g_ScorePtrs[idx]);
+	R->ECX(g_ScorePtrs[ScoreDrawIndex(R->EAX())]);
 	return 0x5C9F88;
 }
 
@@ -855,9 +863,96 @@ DEFINE_HOOK(0x5C9FDD, PlayerLimit16_Score_DrawPtr_ECX_e, 7)
 {
 	if (!PlayerLimit16::IsActive())
 		return 0;
-	DWORD idx = R->EAX();
-	if (idx >= static_cast<DWORD>(SCORE_SLOT_MAX))
-		idx = 0;
-	R->ECX(g_ScorePtrs[idx]);
+	R->ECX(g_ScorePtrs[ScoreDrawIndex(R->EAX())]);
 	return 0x5C9FE4;
+}
+
+/* Stop after SCORE_VISIBLE_ROWS so off-panel rows are not drawn over chrome */
+/* After inc eax / add edx,0x14: 5CA040 cmp eax,ecx */
+DEFINE_HOOK(0x5CA040, PlayerLimit16_Score_VisibleCap, 2)
+{
+	if (!PlayerLimit16::IsActive())
+		return 0;
+	DWORD row = R->EAX(); /* already incremented */
+	if (row >= static_cast<DWORD>(SCORE_VISIBLE_ROWS))
+	{
+		/* force eax >= ecx so jl is not taken */
+		R->ECX(row);
+	}
+	return 0;
+}
+
+/*
+ * Score dialog proc (0x5C9B10): handle WM_MOUSEWHEEL (0x20A) and VK via 0x100.
+ * EDI = message. Scroll list when more than 8 score rows exist.
+ */
+DEFINE_HOOK(0x5C9B4F, PlayerLimit16_Score_DialogScroll, 3)
+{
+	if (!PlayerLimit16::IsActive())
+		return 0;
+
+	const DWORD msg = R->EDI();
+	const DWORD count = *reinterpret_cast<DWORD*>(ADDR_SCORE_SLOT_COUNT);
+	if (count <= static_cast<DWORD>(SCORE_VISIBLE_ROWS))
+		return 0;
+
+	int maxScroll = static_cast<int>(count) - SCORE_VISIBLE_ROWS;
+	if (maxScroll < 0)
+		maxScroll = 0;
+
+	bool scrolled = false;
+
+	if (msg == 0x20A) /* WM_MOUSEWHEEL */
+	{
+		/* After sub esp,0x18C + push ebx/esi/edi: wParam at [esp+0x1A4] */
+		const DWORD wParam = *reinterpret_cast<DWORD*>(R->ESP() + 0x1A4);
+		const short zDelta = static_cast<short>(wParam >> 16);
+		if (zDelta > 0)
+			g_ScoreScroll--;
+		else if (zDelta < 0)
+			g_ScoreScroll++;
+		scrolled = true;
+	}
+	else if (msg == 0x100) /* WM_KEYDOWN */
+	{
+		const DWORD wParam = *reinterpret_cast<DWORD*>(R->ESP() + 0x1A4);
+		if (wParam == 0x21) /* VK_PRIOR page up */
+		{
+			g_ScoreScroll -= SCORE_VISIBLE_ROWS;
+			scrolled = true;
+		}
+		else if (wParam == 0x22) /* VK_NEXT */
+		{
+			g_ScoreScroll += SCORE_VISIBLE_ROWS;
+			scrolled = true;
+		}
+		else if (wParam == 0x26) /* VK_UP */
+		{
+			g_ScoreScroll--;
+			scrolled = true;
+		}
+		else if (wParam == 0x28) /* VK_DOWN */
+		{
+			g_ScoreScroll++;
+			scrolled = true;
+		}
+	}
+
+	if (!scrolled)
+		return 0;
+
+	if (g_ScoreScroll < 0)
+		g_ScoreScroll = 0;
+	if (g_ScoreScroll > maxScroll)
+		g_ScoreScroll = maxScroll;
+
+	Log("[Score] scroll=%d / max=%d (count=%u)\n", g_ScoreScroll, maxScroll, count);
+
+	/* Force repaint via custom score paint message 0x497 */
+	{
+		HWND hwnd = *reinterpret_cast<HWND*>(R->ESP() + 0x19C); /* hwnd after same frame */
+		if (hwnd)
+			PostMessageA(hwnd, 0x497, 0, 0);
+	}
+	return 0x5CA100; /* eat message, return FALSE path */
 }
