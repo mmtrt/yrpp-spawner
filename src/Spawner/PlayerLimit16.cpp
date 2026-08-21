@@ -767,8 +767,23 @@ static void ScoreRebuildPtrTable()
 	if (count > 1)
 		qsort(g_ScorePtrs, count, sizeof(DWORD), ScoreEntryCompar);
 
-	Log("[Score] rebuild ptrs count=%u first=%08X\n",
-		count, count ? g_ScorePtrs[0] : 0);
+	/*
+	 * Stock score panel only fits 8 rows. Keep all 16 entries sorted in
+	 * g_ScorePtrs, but clamp the engine count so the draw loop stops at 8
+	 * (avoids short DEFINE_HOOKs that Syringe overwrites past instruction
+	 * boundaries → AV at 0x5CA04B).
+	 */
+	if (count > 8)
+	{
+		*reinterpret_cast<DWORD*>(ADDR_SCORE_SLOT_COUNT) = 8;
+		Log("[Score] rebuild ptrs full=%u display=8 first=%08X\n",
+			count, g_ScorePtrs[0]);
+	}
+	else
+	{
+		Log("[Score] rebuild ptrs count=%u first=%08X\n",
+			count, count ? g_ScorePtrs[0] : 0);
+	}
 }
 
 /* 0x5C9AA0: entire rebuild function → ret at 0x5C9ADD */
@@ -852,19 +867,3 @@ DEFINE_HOOK(0x5C9FDD, PlayerLimit16_Score_DrawPtr_ECX_e, 7)
 	R->ECX(g_ScorePtrs[ScoreDrawIndex(R->EAX())]);
 	return 0x5C9FE4;
 }
-
-/*
- * Cap on-screen rows at 8 (stock panel height). Data still holds 16 sorted
- * entries; rows 8..15 exist but are not drawn. No dialog-proc hooks — a
- * short DEFINE_HOOK at 0x5C9B4F corrupted the following je and crashed.
- */
-DEFINE_HOOK(0x5CA040, PlayerLimit16_Score_VisibleCap, 2)
-{
-	if (!PlayerLimit16::IsActive())
-		return 0;
-	/* cmp eax, ecx — eax is row index after inc */
-	if (R->EAX() >= 8)
-		R->ECX(R->EAX()); /* force fall-through out of jl */
-	return 0;
-}
-
