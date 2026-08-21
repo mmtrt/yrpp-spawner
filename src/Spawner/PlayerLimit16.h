@@ -7,7 +7,7 @@
  *  - Expand HouseClass DynamicVector to 16 slots
  *  - Batch-refill GameModeOptions AISlots so AIPlayers > 7 create
  *  - Rewrite waypoint house-index table when it holds cell values
- *  - Cap end-game score rows at 8 (stock UI) to avoid AV with 9–16 houses
+ *  - Expand end-game score buffers to 16 rows (custom entries + ptr table)
  *
  * Enable when SpawnerConfig::AIPlayers > 7 or a dedicated flag is set.
  * Add PlayerLimit16.cpp to Spawner.vcxproj; Syringe picks up DEFINE_HOOKs.

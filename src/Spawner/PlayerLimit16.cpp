@@ -6,8 +6,8 @@
  *  - AI create loop: after first 8-slot pass, refill AISlots for missing AI
  *  - Save/restore originals across second AssignHouses
  *  - Waypoint table rewrite (cell values → house indices)
- *  - Score screen: cap filled rows at 8 (stock 0xA8D1FC array) to stop
- *    end-game AV at 0x5C9917 when House count > 8
+ *  - Score screen: 16-row custom buffers (entries + ptr table) with
+ *    ESI bias so stock [esi+0xA8D1xx] stores land in g_ScoreEntries
  *
  * Drop standalone 16player.dll from Syringe inject list after integrating.
  */
@@ -420,7 +420,7 @@ DEFINE_HOOK(0x5EEA19, PlayerLimit16_HouseArray_Loop, 6)
 	PlayerLimit16::ExpandHouseArray("Loop");
 	if (g_UsingEngineBuffer)
 		return 0; /* engine ptr already correct */
-		R->EDX(reinterpret_cast<DWORD>(g_HouseArray16));
+	R->EDX(reinterpret_cast<DWORD>(g_HouseArray16));
 	return 0x5EEA1F;
 }
 
@@ -640,20 +640,80 @@ DEFINE_HOOK(0x6882C5, PlayerLimit16_AICreate_EndBound, 6)
 }
 
 // ---------------------------------------------------------------------------
-// Hooks – end-game score screen (stock array is 8 × 0x70 at 0xA8D1FC)
+// Hooks – end-game score screen expansion (16 rows)
 //
-// gamemd 0x5C98A0 walks HouseClass::Array.Count with no slot cap and writes
-// score entries at 0xA8D1FC + slot*0x70. With 16 houses, slots 8+ overrun
-// BSS → AV at 0x5C9917 (mov [esi+0xA8D228], 0). Cap at 8 so the match can
-// exit; full 16-row score needs reallocated storage later.
+// Stock layout (cannot grow in place — next global is at 0xA8D57C):
+//   0xA8D1FC  score entries  8 × 0x70
+//   0xA8D580  filled slot count
+//   0xABF958  pointer table   8 × DWORD  (rebuilt + qsort'd)
+//
+// Strategy: custom 16-entry buffer + 16 ptrs. After the game computes
+//   esi = slot * 0x70
+// we bias ESI so  esi + 0xA8D1FC  lands inside g_ScoreEntries. All later
+// stores of the form  [esi+0xA8D2xx]  then hit our buffer. Rebuild/draw
+// sites that use immediates 0xA8D1FC / 0xABF958 are redirected the same way.
+//
+// Note: AI rows showing difficulty text ("Easy") under Kills is stock YR
+// behavior (entry+0x28 / string tables for non-human houses), not the 8-cap.
 // ---------------------------------------------------------------------------
 
 static constexpr DWORD ADDR_SCORE_SLOT_COUNT = 0x00A8D580;
-static constexpr int   SCORE_SLOT_MAX        = 8; // stock score UI capacity
+static constexpr DWORD ADDR_SCORE_ENTRIES    = 0x00A8D1FC;
+static constexpr DWORD ADDR_SCORE_PTRS       = 0x00ABF958;
+static constexpr DWORD SCORE_ENTRY_STRIDE    = 0x70;
+static constexpr int   SCORE_SLOT_MAX        = 16; // expanded
+
+alignas(16) static uint8_t  g_ScoreEntries[SCORE_SLOT_MAX * SCORE_ENTRY_STRIDE] {};
+static uint32_t             g_ScorePtrs[SCORE_SLOT_MAX] {};
+static bool                 g_ScoreBufLogged = false;
+
+static DWORD ScoreEntryDelta()
+{
+	return reinterpret_cast<DWORD>(g_ScoreEntries) - ADDR_SCORE_ENTRIES;
+}
+
+/* Bias ESI so stock [esi+0xA8D1FC]-style addressing hits g_ScoreEntries. */
+static void ScoreBiasEsiEbx(REGISTERS* R)
+{
+	DWORD esi = R->ESI() + ScoreEntryDelta();
+	R->ESI(esi);
+	R->EBX(esi + ADDR_SCORE_ENTRIES);
+	if (!g_ScoreBufLogged)
+	{
+		g_ScoreBufLogged = true;
+		Log("[Score] entries@%p ptrs@%p delta=0x%08X\n",
+			static_cast<void*>(g_ScoreEntries),
+			static_cast<void*>(g_ScorePtrs),
+			ScoreEntryDelta());
+	}
+}
 
 /*
+ * 0x5C9911: lea ebx, [esi+0xA8D1FC]  (6 bytes)
+ * ESI already = slot*0x70. Bias and set EBX; skip original lea.
+ */
+DEFINE_HOOK(0x5C9911, PlayerLimit16_Score_EntryBase, 6)
+{
+	if (!PlayerLimit16::IsActive())
+		return 0;
+	ScoreBiasEsiEbx(R);
+	return 0x5C9917;
+}
+
+/*
+ * Campaign/alt fill at 0x46DAE4: lea ebx, [esi+0xA8D1FC]  (6 bytes)
+ */
+DEFINE_HOOK(0x46DAE4, PlayerLimit16_Score_EntryBase_Campaign, 6)
+{
+	if (!PlayerLimit16::IsActive())
+		return 0;
+	ScoreBiasEsiEbx(R);
+	return 0x46DAEA;
+}
+
+/*
+ * Safety: never write more than 16 score rows (house count can include neutrals).
  * 0x5C98F1: mov eax, [0xA8D580]  (5 bytes)
- * When already 8 score rows filled, skip this house (same as null/spectator path).
  */
 DEFINE_HOOK(0x5C98F1, PlayerLimit16_ScoreSlotCap, 5)
 {
@@ -664,43 +724,133 @@ DEFINE_HOOK(0x5C98F1, PlayerLimit16_ScoreSlotCap, 5)
 	if (slots >= static_cast<DWORD>(SCORE_SLOT_MAX))
 	{
 		Log("[Score] slot full (%u) – skip further score rows\n", slots);
-		return 0x5C9A7E; /* loop tail: next house index */
+		return 0x5C9A7E;
 	}
 	return 0;
 }
 
-/*
- * 0x5C9AA1: mov esi, [0xA8D580]  (6 bytes) — after push esi at 0x5C9AA0.
- * Clamp count so pointer fill does not walk past 8 reserved entries.
- */
-DEFINE_HOOK(0x5C9AA1, PlayerLimit16_ScorePtrTableCap, 6)
+/* ---- pointer-table rebuild #1 (0x5C9AA0) ---- */
+
+DEFINE_HOOK(0x5C9AAB, PlayerLimit16_Score_PtrRebuild1_ECX, 5)
 {
 	if (!PlayerLimit16::IsActive())
 		return 0;
-
-	DWORD* pCount = reinterpret_cast<DWORD*>(ADDR_SCORE_SLOT_COUNT);
-	if (*pCount > static_cast<DWORD>(SCORE_SLOT_MAX))
-	{
-		Log("[Score] clamp ptr-table count %u → %d\n", *pCount, SCORE_SLOT_MAX);
-		*pCount = static_cast<DWORD>(SCORE_SLOT_MAX);
-	}
-	return 0;
+	R->ECX(reinterpret_cast<DWORD>(g_ScorePtrs));
+	return 0x5C9AB0;
 }
 
-/*
- * 0x5C9D47: second path that rebuilds the same pointer table (post-sort UI).
- * Bytes: 8B 2D 80 D5 A8 00  (mov ebp, [0xA8D580]) — length 6.
- */
-DEFINE_HOOK(0x5C9D47, PlayerLimit16_ScorePtrTableCap2, 6)
+DEFINE_HOOK(0x5C9AB0, PlayerLimit16_Score_PtrRebuild1_EAX, 5)
 {
 	if (!PlayerLimit16::IsActive())
 		return 0;
+	R->EAX(reinterpret_cast<DWORD>(g_ScoreEntries));
+	return 0x5C9AB5;
+}
 
-	DWORD* pCount = reinterpret_cast<DWORD*>(ADDR_SCORE_SLOT_COUNT);
-	if (*pCount > static_cast<DWORD>(SCORE_SLOT_MAX))
-	{
-		Log("[Score] clamp ptr-table2 count %u → %d\n", *pCount, SCORE_SLOT_MAX);
-		*pCount = static_cast<DWORD>(SCORE_SLOT_MAX);
-	}
-	return 0;
+/* push 0xABF958  → push g_ScorePtrs */
+DEFINE_HOOK(0x5C9ACF, PlayerLimit16_Score_PtrRebuild1_Push, 5)
+{
+	if (!PlayerLimit16::IsActive())
+		return 0;
+	DWORD esp = R->ESP() - 4;
+	R->ESP(esp);
+	*reinterpret_cast<DWORD*>(esp) = reinterpret_cast<DWORD>(g_ScorePtrs);
+	return 0x5C9AD4;
+}
+
+/* ---- pointer-table rebuild #2 (after re-fill, 0x5C9D51) ---- */
+
+DEFINE_HOOK(0x5C9D51, PlayerLimit16_Score_PtrRebuild2_ECX, 5)
+{
+	if (!PlayerLimit16::IsActive())
+		return 0;
+	R->ECX(reinterpret_cast<DWORD>(g_ScorePtrs));
+	return 0x5C9D56;
+}
+
+DEFINE_HOOK(0x5C9D56, PlayerLimit16_Score_PtrRebuild2_EAX, 5)
+{
+	if (!PlayerLimit16::IsActive())
+		return 0;
+	R->EAX(reinterpret_cast<DWORD>(g_ScoreEntries));
+	return 0x5C9D5B;
+}
+
+DEFINE_HOOK(0x5C9D75, PlayerLimit16_Score_PtrRebuild2_Push, 5)
+{
+	if (!PlayerLimit16::IsActive())
+		return 0;
+	DWORD esp = R->ESP() - 4;
+	R->ESP(esp);
+	*reinterpret_cast<DWORD*>(esp) = reinterpret_cast<DWORD>(g_ScorePtrs);
+	return 0x5C9D7A;
+}
+
+/* ---- draw path: mov reg, [index*4 + 0xABF958] (7 bytes) ---- */
+
+DEFINE_HOOK(0x5C9DF4, PlayerLimit16_Score_DrawPtr_EDX, 7)
+{
+	if (!PlayerLimit16::IsActive())
+		return 0;
+	DWORD idx = R->ECX();
+	if (idx >= static_cast<DWORD>(SCORE_SLOT_MAX))
+		idx = 0;
+	R->EDX(g_ScorePtrs[idx]);
+	return 0x5C9DFB;
+}
+
+DEFINE_HOOK(0x5C9E8A, PlayerLimit16_Score_DrawPtr_ECX_a, 7)
+{
+	if (!PlayerLimit16::IsActive())
+		return 0;
+	DWORD idx = R->EDX();
+	if (idx >= static_cast<DWORD>(SCORE_SLOT_MAX))
+		idx = 0;
+	R->ECX(g_ScorePtrs[idx]);
+	return 0x5C9E91;
+}
+
+DEFINE_HOOK(0x5C9EC9, PlayerLimit16_Score_DrawPtr_ECX_b, 7)
+{
+	if (!PlayerLimit16::IsActive())
+		return 0;
+	/* 8B 0C 85 58 F9 AB 00  — mov ecx, [eax*4+0xABF958] */
+	DWORD idx = R->EAX();
+	if (idx >= static_cast<DWORD>(SCORE_SLOT_MAX))
+		idx = 0;
+	R->ECX(g_ScorePtrs[idx]);
+	return 0x5C9ED0;
+}
+
+DEFINE_HOOK(0x5C9F25, PlayerLimit16_Score_DrawPtr_ECX_c, 7)
+{
+	if (!PlayerLimit16::IsActive())
+		return 0;
+	DWORD idx = R->EAX();
+	if (idx >= static_cast<DWORD>(SCORE_SLOT_MAX))
+		idx = 0;
+	R->ECX(g_ScorePtrs[idx]);
+	return 0x5C9F2C;
+}
+
+DEFINE_HOOK(0x5C9F81, PlayerLimit16_Score_DrawPtr_ECX_d, 7)
+{
+	if (!PlayerLimit16::IsActive())
+		return 0;
+	DWORD idx = R->EAX();
+	if (idx >= static_cast<DWORD>(SCORE_SLOT_MAX))
+		idx = 0;
+	R->ECX(g_ScorePtrs[idx]);
+	return 0x5C9F88;
+}
+
+DEFINE_HOOK(0x5C9FDD, PlayerLimit16_Score_DrawPtr_ECX_e, 7)
+{
+	if (!PlayerLimit16::IsActive())
+		return 0;
+	DWORD idx = R->EAX();
+	if (idx >= static_cast<DWORD>(SCORE_SLOT_MAX))
+		idx = 0;
+	R->ECX(g_ScorePtrs[idx]);
+	return 0x5C9FE4;
 }
