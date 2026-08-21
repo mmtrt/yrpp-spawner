@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <cstdarg>
 #include <cstring>
+#include <cstdlib>
 
 // ---------------------------------------------------------------------------
 // Addresses (YR 1.001 / gamemd). Prefer YRpp globals when available.
@@ -729,61 +730,67 @@ DEFINE_HOOK(0x5C98F1, PlayerLimit16_ScoreSlotCap, 5)
 	return 0;
 }
 
-/* ---- pointer-table rebuild #1 (0x5C9AA0) ---- */
+/*
+ * Replace stock pointer rebuild entirely (avoids fragile push-imm stack hooks
+ * that caused qsort to receive base=4 → AV at 0x5C9AEC reading [4+0x60]).
+ *
+ * Stock 0x5C9AA0:
+ *   build ptrs[i] = entries + i*0x70 for i in [0, count)
+ *   if count > 1: qsort(ptrs, count, 4, compar@0x5C9AE0)
+ */
 
-DEFINE_HOOK(0x5C9AAB, PlayerLimit16_Score_PtrRebuild1_ECX, 5)
+static int __cdecl ScoreEntryCompar(const void* a, const void* b)
 {
-	if (!PlayerLimit16::IsActive())
+	const DWORD ea = *static_cast<const DWORD*>(a);
+	const DWORD eb = *static_cast<const DWORD*>(b);
+	if (!ea || !eb)
 		return 0;
-	R->ECX(reinterpret_cast<DWORD>(g_ScorePtrs));
-	return 0x5C9AB0;
+	const int va = *reinterpret_cast<const int*>(ea + 0x60);
+	const int vb = *reinterpret_cast<const int*>(eb + 0x60);
+	if (va == vb)
+		return 0;
+	/* Match game: -1 if va <= vb, else +1 */
+	return (va <= vb) ? -1 : 1;
 }
 
-DEFINE_HOOK(0x5C9AB0, PlayerLimit16_Score_PtrRebuild1_EAX, 5)
+static void ScoreRebuildPtrTable()
 {
-	if (!PlayerLimit16::IsActive())
-		return 0;
-	R->EAX(reinterpret_cast<DWORD>(g_ScoreEntries));
-	return 0x5C9AB5;
+	DWORD count = *reinterpret_cast<DWORD*>(ADDR_SCORE_SLOT_COUNT);
+	if (count > static_cast<DWORD>(SCORE_SLOT_MAX))
+		count = static_cast<DWORD>(SCORE_SLOT_MAX);
+
+	for (DWORD i = 0; i < count; i++)
+		g_ScorePtrs[i] = reinterpret_cast<DWORD>(&g_ScoreEntries[i * SCORE_ENTRY_STRIDE]);
+	for (DWORD i = count; i < static_cast<DWORD>(SCORE_SLOT_MAX); i++)
+		g_ScorePtrs[i] = 0;
+
+	if (count > 1)
+		qsort(g_ScorePtrs, count, sizeof(DWORD), ScoreEntryCompar);
+
+	Log("[Score] rebuild ptrs count=%u first=%08X\n",
+		count, count ? g_ScorePtrs[0] : 0);
 }
 
-/* push 0xABF958  → push g_ScorePtrs */
-DEFINE_HOOK(0x5C9ACF, PlayerLimit16_Score_PtrRebuild1_Push, 5)
+/* 0x5C9AA0: entire rebuild function → ret at 0x5C9ADD */
+/* length 1 = push esi only; skip whole function to ret (no pop needed) */
+DEFINE_HOOK(0x5C9AA0, PlayerLimit16_Score_PtrRebuild1, 1)
 {
 	if (!PlayerLimit16::IsActive())
 		return 0;
-	DWORD esp = R->ESP() - 4;
-	R->ESP(esp);
-	*reinterpret_cast<DWORD*>(esp) = reinterpret_cast<DWORD>(g_ScorePtrs);
-	return 0x5C9AD4;
+	ScoreRebuildPtrTable();
+	return 0x5C9ADD;
 }
 
-/* ---- pointer-table rebuild #2 (after re-fill, 0x5C9D51) ---- */
-
-DEFINE_HOOK(0x5C9D51, PlayerLimit16_Score_PtrRebuild2_ECX, 5)
+/*
+ * Inlined second rebuild at 0x5C9D47 (mov ebp,[count]) through qsort.
+ * Skip to 0x5C9D82 where original continues with stack locals.
+ */
+DEFINE_HOOK(0x5C9D47, PlayerLimit16_Score_PtrRebuild2, 6)
 {
 	if (!PlayerLimit16::IsActive())
 		return 0;
-	R->ECX(reinterpret_cast<DWORD>(g_ScorePtrs));
-	return 0x5C9D56;
-}
-
-DEFINE_HOOK(0x5C9D56, PlayerLimit16_Score_PtrRebuild2_EAX, 5)
-{
-	if (!PlayerLimit16::IsActive())
-		return 0;
-	R->EAX(reinterpret_cast<DWORD>(g_ScoreEntries));
-	return 0x5C9D5B;
-}
-
-DEFINE_HOOK(0x5C9D75, PlayerLimit16_Score_PtrRebuild2_Push, 5)
-{
-	if (!PlayerLimit16::IsActive())
-		return 0;
-	DWORD esp = R->ESP() - 4;
-	R->ESP(esp);
-	*reinterpret_cast<DWORD*>(esp) = reinterpret_cast<DWORD>(g_ScorePtrs);
-	return 0x5C9D7A;
+	ScoreRebuildPtrTable();
+	return 0x5C9D82;
 }
 
 /* ---- draw path: mov reg, [index*4 + 0xABF958] (7 bytes) ---- */
