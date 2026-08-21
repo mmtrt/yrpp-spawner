@@ -749,8 +749,8 @@ static int __cdecl ScoreEntryCompar(const void* a, const void* b)
 	const int vb = *reinterpret_cast<const int*>(eb + 0x60);
 	if (va == vb)
 		return 0;
-	/* Match game: -1 if va <= vb, else +1 */
-	return (va <= vb) ? -1 : 1;
+	/* Descending: highest score first (leaderboard). Stock was ascending. */
+	return (va > vb) ? -1 : 1;
 }
 
 static void ScoreRebuildPtrTable()
