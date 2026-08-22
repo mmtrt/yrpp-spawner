@@ -467,6 +467,30 @@ static void EnsureStartingPoints(const char* why)
 		num = STOCK_START_SLOTS;
 	}
 
+	/*
+	 * Engine/spawner often rewrites HouseIndices back to waypoint *cell*
+	 * values (e.g. 295, 135). Re-normalize to house indices 0..count-1
+	 * every time we run — required for marker color + 640F safety.
+	 */
+	bool hiCorrupt = false;
+	for (int i = 0; i < MaxPlayers; i++)
+	{
+		int v = houseIdx[i];
+		if (v > MaxPlayers || (v < -1))
+		{
+			hiCorrupt = true;
+			break;
+		}
+	}
+	if (hiCorrupt || houseIdx[0] > MaxPlayers)
+	{
+		Log("[StartPts] HouseIndices corrupt – rewriting to 0..%d\n", houseCount - 1);
+		for (int i = 0; i < houseCount; i++)
+			houseIdx[i] = i;
+		for (int i = houseCount; i < MaxPlayers; i++)
+			houseIdx[i] = -1;
+	}
+
 	bool anyNonZero = false;
 	for (int i = 0; i < STOCK_START_SLOTS; i++)
 	{
@@ -477,10 +501,11 @@ static void EnsureStartingPoints(const char* why)
 	}
 	if (anyNonZero && num > 0)
 	{
+		/* Keep number clamped even if something else bumps it later */
+		*pNum = (num > STOCK_START_SLOTS) ? STOCK_START_SLOTS : num;
 		if (!g_StartPtsFixed)
-			Log("[StartPts] stock slots populated, NumberStartingPoints=%d\n", num);
+			Log("[StartPts] stock slots populated, NumberStartingPoints=%d\n", *pNum);
 		g_StartPtsFixed = true;
-		/* Cap already applied above; nothing more to fill */
 		return;
 	}
 
@@ -710,40 +735,38 @@ DEFINE_HOOK(0x552D60, PlayerLimit16_LoadProgress_Draw, 5)
 }
 
 /*
- * After progress surface exists (LoadProgress +0x60 set), try the stock
- * start-marker drawer once. Early DLL showed 8 mono (orange) marks when this
- * path ran; multi-color on 8-player maps is mostly baked into the map Preview.
- *
- * thiscall 0x640710(BSurface* this, void* hwndOrDc)
- * Surfaces seen in engine: 0xAC1154, 0xABE154 – try both.
+ * Re-clamp right before the progress surface blit (0x553687).
+ * Spawner/engine often bumps NumberStartingPoints back to 16 and rewrites
+ * HouseIndices to cell coords between our earlier fix and the real draw.
  */
-DEFINE_HOOK(0x553687, PlayerLimit16_LoadProgress_TryStartMarks, 5)
+DEFINE_HOOK(0x553687, PlayerLimit16_LoadProgress_Reclamp, 5)
 {
 	if (!PlayerLimit16::IsActive())
 		return 0;
-
-	EnsureStartingPoints("LoadProgress::TryStartMarks");
-
-	static bool s_tried = false;
-	if (s_tried)
-		return 0;
-	s_tried = true;
-
-	using DrawFn = void (__thiscall*)(void* self, void* arg);
-	auto draw = reinterpret_cast<DrawFn>(0x640710);
-
-	DWORD surfaces[] = {
-		*reinterpret_cast<DWORD*>(0x00AC1154),
-		*reinterpret_cast<DWORD*>(0x00ABE154),
-	};
-	for (DWORD s : surfaces)
-	{
-		if (!IsPlausiblePtr(s))
-			continue;
-		Log("[StartPts] TryStartMarks: calling 0x640710 this=%08X\n", s);
-		draw(reinterpret_cast<void*>(s), nullptr);
-	}
+	EnsureStartingPoints("LoadProgress::Reclamp");
 	return 0;
+}
+
+/*
+ * Also re-clamp at the NumberStartingPoints > 8 skip site so any late
+ * writer that sets 16 cannot suppress markers.
+ * Original: cmp eax, 8 / jg skip  at 0x6408E2
+ */
+DEFINE_HOOK(0x6408E2, PlayerLimit16_StartPts_AllowEight, 3)
+{
+	if (!PlayerLimit16::IsActive())
+		return 0;
+	/* Force the comparison path to treat value as 8 when > 8 */
+	DWORD num = R->EAX();
+	if (num > static_cast<DWORD>(STOCK_START_SLOTS))
+	{
+		Log("[StartPts] AllowEight: eax %u → 8\n", num);
+		R->EAX(STOCK_START_SLOTS);
+		DWORD scen = *reinterpret_cast<DWORD*>(ADDR_MAP);
+		if (IsPlausiblePtr(scen))
+			*reinterpret_cast<int*>(scen + OFF_NUM_START_POINTS) = STOCK_START_SLOTS;
+	}
+	return 0; /* fall into original cmp eax, 8 */
 }
 
 /*
