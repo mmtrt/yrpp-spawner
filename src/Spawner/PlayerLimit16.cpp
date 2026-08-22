@@ -151,7 +151,17 @@ bool PlayerLimit16::IsActive()
 {
 	if (g_ForceEnabled)
 		return true;
-	return GetAIPlayers() > 7;
+	if (GetAIPlayers() > 7)
+		return true;
+	/* 8-player match on a 16-start map still needs waypoint/start guards */
+	DWORD scen = *reinterpret_cast<DWORD*>(ADDR_MAP);
+	if (IsPlausiblePtr(scen))
+	{
+		int n = *reinterpret_cast<int*>(scen + OFF_NUM_START_POINTS);
+		if (n > STOCK_START_SLOTS)
+			return true;
+	}
+	return false;
 }
 
 void PlayerLimit16::SetForceEnabled(bool enabled)
@@ -668,11 +678,11 @@ DEFINE_HOOK(0x5D6CBF, PlayerLimit16_Waypoint_HouseLoad, 6)
 		EnsureStartingPoints("Waypoint");
 	}
 
-	DWORD house = (idx < MaxPlayers) ? live[idx] : 0;
-	/* Null only – strict vtable checks rejected valid Ares/Phobos houses */
-	if (!house)
+	DWORD house = (idx < static_cast<DWORD>(MaxPlayers) && live) ? live[idx] : 0;
+	/* Null / invalid – strict vtable rejected valid Ares houses; still require plausible ptr */
+	if (!house || !IsPlausiblePtr(house))
 	{
-		Log("[Waypoint] idx %u null house – skip body\n", idx);
+		Log("[Waypoint] idx %u bad house=%08X – skip body\n", idx, house);
 		return 0x5D6D3F;
 	}
 	return 0x5D6CC5;
