@@ -699,6 +699,33 @@ DEFINE_HOOK(0x552D60, PlayerLimit16_LoadProgress_Draw, 5)
 	return 0;
 }
 
+/*
+ * 0x6408D4 reads NumberStartingPoints then:
+ *   if (num <= 0 || num > 8) skip colored start markers entirely.
+ * Spawner sets num=16 for 16-player maps → no colored indicators.
+ * Cap to 8 here (same moment the draw path reads the value).
+ */
+DEFINE_HOOK(0x6408D4, PlayerLimit16_StartPts_ColorDrawGuard, 6)
+{
+	if (!PlayerLimit16::IsActive())
+		return 0;
+
+	DWORD scen = R->ECX();
+	if (!IsPlausiblePtr(scen))
+		return 0;
+
+	int* pNum = reinterpret_cast<int*>(scen + OFF_NUM_START_POINTS);
+	int num = *pNum;
+	if (num > STOCK_START_SLOTS)
+	{
+		Log("[StartPts] ColorDrawGuard: clamp %d → %d\n", num, STOCK_START_SLOTS);
+		*pNum = STOCK_START_SLOTS;
+		num = STOCK_START_SLOTS;
+	}
+	R->EAX(static_cast<DWORD>(num));
+	return 0x6408DA; /* original next: test eax, eax */
+}
+
 /* Also run once after houses exist (waypoint pass) so data is ready early */
 
 // ---------------------------------------------------------------------------
