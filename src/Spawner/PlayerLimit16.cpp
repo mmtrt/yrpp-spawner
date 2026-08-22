@@ -435,6 +435,12 @@ static void DumpWaypointTable()
  */
 static bool g_StartPtsFixed = false;
 
+/* Scenario StartingPoints is only 8 deep (then HouseIndices at +0x1180).
+ * Own 16-slot table + draw redirects for full minimap markers. */
+static int g_StartPts16[16 * 2] = {}; /* Point2D x,y */
+static bool g_StartPts16Ready = false;
+static constexpr int START_SLOTS_16 = 16;
+
 static void EnsureStartingPoints(const char* why)
 {
 	DWORD scen = *reinterpret_cast<DWORD*>(ADDR_MAP);
@@ -442,47 +448,36 @@ static void EnsureStartingPoints(const char* why)
 		return;
 
 	int* pNum = reinterpret_cast<int*>(scen + OFF_NUM_START_POINTS);
-	int* pts  = reinterpret_cast<int*>(scen + OFF_STARTING_POINTS); /* Point2D = 2 ints */
+	int* pts  = reinterpret_cast<int*>(scen + OFF_STARTING_POINTS); /* stock 8 */
 	int* houseIdx = reinterpret_cast<int*>(scen + OFF_WP_HOUSE_TABLE);
 
-	int num = *pNum;
 	int houseCount = *reinterpret_cast<int*>(ADDR_HOUSE_COUNT);
 	if (houseCount < 0)
 		houseCount = 0;
 	if (houseCount > MaxPlayers)
 		houseCount = MaxPlayers;
 
-	Log("[StartPts] %s: NumberStartingPoints=%d HouseCount=%d\n", why, num, houseCount);
+	int want = houseCount;
+	if (want < 1)
+		want = STOCK_START_SLOTS;
+	if (want > START_SLOTS_16)
+		want = START_SLOTS_16;
 
-	/*
-	 * Stock StartingPoints[8] only. Spawner may set NumberStartingPoints=16;
-	 * the load minimap loop then walks past the array into HouseIndices and
-	 * either draws garbage or skips colored indicators entirely. Cap at 8.
-	 */
-	if (num > STOCK_START_SLOTS)
-	{
-		Log("[StartPts] capping NumberStartingPoints %d → %d (stock array size)\n",
-			num, STOCK_START_SLOTS);
-		*pNum = STOCK_START_SLOTS;
-		num = STOCK_START_SLOTS;
-	}
+	Log("[StartPts] %s: NumberStartingPoints=%d HouseCount=%d want=%d\n",
+		why, *pNum, houseCount, want);
 
-	/*
-	 * Engine/spawner often rewrites HouseIndices back to waypoint *cell*
-	 * values (e.g. 295, 135). Re-normalize to house indices 0..count-1
-	 * every time we run — required for marker color + 640F safety.
-	 */
+	/* Fix HouseIndices if engine rewrote cells into it */
 	bool hiCorrupt = false;
 	for (int i = 0; i < MaxPlayers; i++)
 	{
 		int v = houseIdx[i];
-		if (v > MaxPlayers || (v < -1))
+		if (v > MaxPlayers || v < -1)
 		{
 			hiCorrupt = true;
 			break;
 		}
 	}
-	if (hiCorrupt || houseIdx[0] > MaxPlayers)
+	if (hiCorrupt)
 	{
 		Log("[StartPts] HouseIndices corrupt – rewriting to 0..%d\n", houseCount - 1);
 		for (int i = 0; i < houseCount; i++)
@@ -491,64 +486,43 @@ static void EnsureStartingPoints(const char* why)
 			houseIdx[i] = -1;
 	}
 
-	bool anyNonZero = false;
-	for (int i = 0; i < STOCK_START_SLOTS; i++)
-	{
-		if (pts[i * 2] != 0 || pts[i * 2 + 1] != 0)
-			anyNonZero = true;
-		Log("[StartPts]   slot %d = (%d,%d) houseIdx=%d\n",
-			i, pts[i * 2], pts[i * 2 + 1], houseIdx[i]);
-	}
-	if (anyNonZero && num > 0)
-	{
-		/* Keep number clamped even if something else bumps it later */
-		*pNum = (num > STOCK_START_SLOTS) ? STOCK_START_SLOTS : num;
-		if (!g_StartPtsFixed)
-			Log("[StartPts] stock slots populated, NumberStartingPoints=%d\n", *pNum);
-		g_StartPtsFixed = true;
-		return;
-	}
-
-	/*
-	 * Rebuild from Scenario waypoints 0..7 via engine GetWaypointCoords (0x68BCC0).
-	 * CellStruct { short X, Y }; Point2D stores same as ints for StartingPoints.
-	 */
 	using GetWpFn = void* (__thiscall*)(void* scen, void* dest, int idx);
 	auto getWp = reinterpret_cast<GetWpFn>(0x68BCC0);
 
+	/* Build expanded 16-slot table from waypoints */
 	int filled = 0;
-	for (int i = 0; i < STOCK_START_SLOTS; i++)
+	for (int i = 0; i < START_SLOTS_16; i++)
 	{
 		short cell[2] = { 0, 0 };
 		getWp(reinterpret_cast<void*>(scen), cell, i);
-		/* Undefined waypoint is often (-1,-1) or (0,0) */
 		if (cell[0] < 0 || cell[1] < 0)
+		{
+			g_StartPts16[i * 2] = 0;
+			g_StartPts16[i * 2 + 1] = 0;
 			continue;
-		if (cell[0] == 0 && cell[1] == 0 && i > 0)
-			continue;
-
-		pts[i * 2]     = static_cast<int>(cell[0]);
-		pts[i * 2 + 1] = static_cast<int>(cell[1]);
-
-		/* Keep HouseIndices aligned: start slot i → house i when plausible */
-		if (houseIdx[i] < 0 || houseIdx[i] >= houseCount)
-			houseIdx[i] = (i < houseCount) ? i : -1;
-
+		}
+		g_StartPts16[i * 2]     = static_cast<int>(cell[0]);
+		g_StartPts16[i * 2 + 1] = static_cast<int>(cell[1]);
+		if (i < houseCount && (houseIdx[i] < 0 || houseIdx[i] >= houseCount))
+			houseIdx[i] = i;
 		filled++;
-		Log("[StartPts] filled slot %d from WP → (%d,%d) house=%d\n",
-			i, pts[i * 2], pts[i * 2 + 1], houseIdx[i]);
+		if (i < want)
+			Log("[StartPts]   slot %d = (%d,%d) houseIdx=%d\n",
+				i, g_StartPts16[i * 2], g_StartPts16[i * 2 + 1], houseIdx[i]);
 	}
 
-	if (filled > 0)
+	/* Mirror first 8 into stock Scenario array (other code paths still read it) */
+	for (int i = 0; i < STOCK_START_SLOTS; i++)
 	{
-		*pNum = filled;
-		g_StartPtsFixed = true;
-		Log("[StartPts] NumberStartingPoints set to %d\n", filled);
+		pts[i * 2]     = g_StartPts16[i * 2];
+		pts[i * 2 + 1] = g_StartPts16[i * 2 + 1];
 	}
-	else
-	{
-		Log("[StartPts] WARNING: could not fill any start points from waypoints\n");
-	}
+
+	*pNum = want;
+	g_StartPts16Ready = (filled > 0);
+	g_StartPtsFixed = true;
+	Log("[StartPts] expanded ready=%d NumberStartingPoints=%d filled=%d\n",
+		g_StartPts16Ready ? 1 : 0, *pNum, filled);
 }
 
 
@@ -752,21 +726,28 @@ DEFINE_HOOK(0x553687, PlayerLimit16_LoadProgress_Reclamp, 5)
  * writer that sets 16 cannot suppress markers.
  * Original: cmp eax, 8 / jg skip  at 0x6408E2
  */
-DEFINE_HOOK(0x6408E2, PlayerLimit16_StartPts_AllowEight, 3)
+/*
+ * Original: cmp eax, 8 / jg skip. Replace comparison limit with 16 so
+ * NumberStartingPoints up to 16 still draws markers.
+ */
+DEFINE_HOOK(0x6408E2, PlayerLimit16_StartPts_AllowSixteen, 3)
 {
 	if (!PlayerLimit16::IsActive())
 		return 0;
-	/* Force the comparison path to treat value as 8 when > 8 */
+	/* Rewrite immediate: cmp eax, 16  (bytes already 83 F8 xx – we set EAX max) */
 	DWORD num = R->EAX();
-	if (num > static_cast<DWORD>(STOCK_START_SLOTS))
+	if (num > static_cast<DWORD>(START_SLOTS_16))
+		R->EAX(START_SLOTS_16);
+	/* Skip the stock cmp/jg by jumping to the test path as if num is valid.
+	 * Original after cmp+jg is 6408EB. We need jg not taken when num<=16.
+	 * Easiest: set EAX to min(num,16) and patch is still cmp 8 — so force
+	 * EAX<=8 only if expanded table not ready; else jump past the jg. */
+	if (g_StartPts16Ready && num > 0)
 	{
-		Log("[StartPts] AllowEight: eax %u → 8\n", num);
-		R->EAX(STOCK_START_SLOTS);
-		DWORD scen = *reinterpret_cast<DWORD*>(ADDR_MAP);
-		if (IsPlausiblePtr(scen))
-			*reinterpret_cast<int*>(scen + OFF_NUM_START_POINTS) = STOCK_START_SLOTS;
+		/* Skip cmp eax,8 / jg skip → land at 0x6408EB (xor esi,esi) */
+		return 0x6408EB;
 	}
-	return 0; /* fall into original cmp eax, 8 */
+	return 0;
 }
 
 /*
@@ -794,23 +775,53 @@ DEFINE_HOOK(0x6408D4, PlayerLimit16_StartPts_ColorDrawGuard, 6)
 	if (!PlayerLimit16::IsActive())
 		return 0;
 
-	/* ECX here is ScenarioClass* (reloaded from 0xA8B230 just above) */
 	DWORD scen = *reinterpret_cast<DWORD*>(ADDR_MAP);
 	if (!IsPlausiblePtr(scen))
 		scen = R->ECX();
 	if (!IsPlausiblePtr(scen))
 		return 0;
 
-	int* pNum = reinterpret_cast<int*>(scen + OFF_NUM_START_POINTS);
-	int num = *pNum;
-	if (num > STOCK_START_SLOTS)
-	{
-		Log("[StartPts] ColorDrawGuard: clamp %d → %d\n", num, STOCK_START_SLOTS);
-		*pNum = STOCK_START_SLOTS;
-		num = STOCK_START_SLOTS;
-	}
+	EnsureStartingPoints("ColorDrawGuard");
+	int num = *reinterpret_cast<int*>(scen + OFF_NUM_START_POINTS);
+	if (num < 0)
+		num = 0;
+	if (num > START_SLOTS_16)
+		num = START_SLOTS_16;
+	*reinterpret_cast<int*>(scen + OFF_NUM_START_POINTS) = num;
 	R->EAX(static_cast<DWORD>(num));
-	return 0x6408DA; /* original next: test eax, eax */
+	Log("[StartPts] ColorDrawGuard: drawing num=%d expanded=%d\n",
+		num, g_StartPts16Ready ? 1 : 0);
+	return 0x6408DA;
+}
+
+/* Redirect StartingPoints[i].X read to g_StartPts16 */
+DEFINE_HOOK(0x6408F5, PlayerLimit16_StartPts_ReadX, 7)
+{
+	if (!PlayerLimit16::IsActive() || !g_StartPts16Ready)
+		return 0;
+	DWORD esi = R->ESI();
+	if (esi >= static_cast<DWORD>(START_SLOTS_16))
+	{
+		R->EAX(0);
+		return 0x6408FC;
+	}
+	R->EAX(static_cast<DWORD>(g_StartPts16[esi * 2]));
+	return 0x6408FC; /* next: mov edi, [ecx+0x112c] */
+}
+
+/* Redirect StartingPoints[i].Y read to g_StartPts16 */
+DEFINE_HOOK(0x64093B, PlayerLimit16_StartPts_ReadY, 7)
+{
+	if (!PlayerLimit16::IsActive() || !g_StartPts16Ready)
+		return 0;
+	DWORD esi = R->ESI();
+	if (esi >= static_cast<DWORD>(START_SLOTS_16))
+	{
+		R->EAX(0);
+		return 0x640942;
+	}
+	R->EAX(static_cast<DWORD>(g_StartPts16[esi * 2 + 1]));
+	return 0x640942; /* next: sub eax, ebx */
 }
 
 /* Also run once after houses exist (waypoint pass) so data is ready early */
