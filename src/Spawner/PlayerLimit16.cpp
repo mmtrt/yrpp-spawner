@@ -57,6 +57,14 @@ static constexpr DWORD ADDR_HTYPE_CNT   = 0x00A83CA8;
 
 // Map / Scenario waypoint house-index table offset
 static constexpr DWORD OFF_WP_HOUSE_TABLE = 0x1180;
+/* ScenarioClass layout (YR): HouseIndices @ +0x1180 → StartingPoints just before */
+static constexpr DWORD OFF_NUM_START_POINTS = 0x113C; /* int NumberStartingPoints */
+static constexpr DWORD OFF_STARTING_POINTS  = 0x1140; /* Point2D StartingPoints[8] */
+static constexpr DWORD OFF_HOUSE_HOME_CELLS = 0x11C0; /* CellStruct HouseHomeCells[8] */
+/* Waypoints[702] CellStruct – each 4 bytes; YRpp places them before map header.
+ * GetWaypointCoords @ 0x68BCC0. Waypoint cell packed: often low 16 = X, high = Y. */
+static constexpr DWORD OFF_WAYPOINTS = 0x5D4; /* approximate; validated at runtime */
+static constexpr int   STOCK_START_SLOTS = 8;
 
 // ---------------------------------------------------------------------------
 // State
@@ -410,6 +418,93 @@ static void DumpWaypointTable()
 	Log("\n");
 }
 
+/*
+ * Loading-screen minimap uses ScenarioClass::StartingPoints[8] + NumberStartingPoints
+ * and house colors. With 16-player maps the spawner often leaves these empty → no
+ * colored indicators. Fill stock 8 slots from waypoint cells / house start spots.
+ */
+static bool g_StartPtsFixed = false;
+
+static void EnsureStartingPoints(const char* why)
+{
+	DWORD scen = *reinterpret_cast<DWORD*>(ADDR_MAP);
+	if (!IsPlausiblePtr(scen))
+		return;
+
+	int* pNum = reinterpret_cast<int*>(scen + OFF_NUM_START_POINTS);
+	int* pts  = reinterpret_cast<int*>(scen + OFF_STARTING_POINTS); /* Point2D = 2 ints */
+	int* houseIdx = reinterpret_cast<int*>(scen + OFF_WP_HOUSE_TABLE);
+
+	int num = *pNum;
+	int houseCount = *reinterpret_cast<int*>(ADDR_HOUSE_COUNT);
+	if (houseCount < 0)
+		houseCount = 0;
+	if (houseCount > MaxPlayers)
+		houseCount = MaxPlayers;
+
+	Log("[StartPts] %s: NumberStartingPoints=%d HouseCount=%d\n", why, num, houseCount);
+
+	/* Already has valid starts — only log once */
+	bool anyNonZero = false;
+	for (int i = 0; i < STOCK_START_SLOTS; i++)
+	{
+		if (pts[i * 2] != 0 || pts[i * 2 + 1] != 0)
+			anyNonZero = true;
+		Log("[StartPts]   slot %d = (%d,%d) houseIdx=%d\n",
+			i, pts[i * 2], pts[i * 2 + 1], houseIdx[i]);
+	}
+	if (anyNonZero && num > 0)
+	{
+		if (!g_StartPtsFixed)
+			Log("[StartPts] stock slots already populated – leave alone\n");
+		g_StartPtsFixed = true;
+		return;
+	}
+
+	/*
+	 * Rebuild from Scenario waypoints 0..7 via engine GetWaypointCoords (0x68BCC0).
+	 * CellStruct { short X, Y }; Point2D stores same as ints for StartingPoints.
+	 */
+	using GetWpFn = void* (__thiscall*)(void* scen, void* dest, int idx);
+	auto getWp = reinterpret_cast<GetWpFn>(0x68BCC0);
+
+	int filled = 0;
+	for (int i = 0; i < STOCK_START_SLOTS; i++)
+	{
+		short cell[2] = { 0, 0 };
+		getWp(reinterpret_cast<void*>(scen), cell, i);
+		/* Undefined waypoint is often (-1,-1) or (0,0) */
+		if (cell[0] < 0 || cell[1] < 0)
+			continue;
+		if (cell[0] == 0 && cell[1] == 0 && i > 0)
+			continue;
+
+		pts[i * 2]     = static_cast<int>(cell[0]);
+		pts[i * 2 + 1] = static_cast<int>(cell[1]);
+
+		/* Keep HouseIndices aligned: start slot i → house i when plausible */
+		if (houseIdx[i] < 0 || houseIdx[i] >= houseCount)
+			houseIdx[i] = (i < houseCount) ? i : -1;
+
+		filled++;
+		Log("[StartPts] filled slot %d from WP → (%d,%d) house=%d\n",
+			i, pts[i * 2], pts[i * 2 + 1], houseIdx[i]);
+	}
+
+	if (filled > 0)
+	{
+		*pNum = filled;
+		g_StartPtsFixed = true;
+		Log("[StartPts] NumberStartingPoints set to %d\n", filled);
+	}
+	else
+	{
+		Log("[StartPts] WARNING: could not fill any start points from waypoints\n");
+	}
+}
+
+
+
 // ---------------------------------------------------------------------------
 // Hooks – house array
 // ---------------------------------------------------------------------------
@@ -557,6 +652,7 @@ DEFINE_HOOK(0x5D6CBF, PlayerLimit16_Waypoint_HouseLoad, 6)
 		}
 		g_WpTableDumped = false;
 		DumpWaypointTable();
+		EnsureStartingPoints("Waypoint");
 	}
 
 	DWORD house = (idx < MaxPlayers) ? live[idx] : 0;
@@ -576,6 +672,21 @@ DEFINE_HOOK(0x5D6D02, PlayerLimit16_Waypoint_NotFoundSkip, 5)
 	Log("[Waypoint] idx %u – not-found, skip\n", R->ESI());
 	return 0x5D6D3F;
 }
+
+
+// ---------------------------------------------------------------------------
+// Loading-screen minimap: ensure StartingPoints + colors before progress draw
+// ---------------------------------------------------------------------------
+
+DEFINE_HOOK(0x552D60, PlayerLimit16_LoadProgress_Draw, 5)
+{
+	if (!PlayerLimit16::IsActive())
+		return 0;
+	EnsureStartingPoints("LoadProgress::Draw");
+	return 0;
+}
+
+/* Also run once after houses exist (waypoint pass) so data is ready early */
 
 // ---------------------------------------------------------------------------
 // Hooks – AI create batch

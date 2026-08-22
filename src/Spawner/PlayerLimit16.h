@@ -8,6 +8,7 @@
  *  - Batch-refill GameModeOptions AISlots so AIPlayers > 7 create
  *  - Rewrite waypoint house-index table when it holds cell values
  *  - Expand end-game score buffers to 16 rows (custom entries + ptr table)
+ *  - Ensure Scenario StartingPoints for loading-screen minimap colors
  *
  * Enable when SpawnerConfig::AIPlayers > 7 or a dedicated flag is set.
  * Add PlayerLimit16.cpp to Spawner.vcxproj; Syringe picks up DEFINE_HOOKs.
