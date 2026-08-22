@@ -522,7 +522,6 @@ static void EnsureStartingPoints(const char* why)
 	}
 
 	*pNum = (num > STOCK_START_SLOTS) ? STOCK_START_SLOTS : num;
-	g_StartPtsFixed = true;
 }
 
 // ---------------------------------------------------------------------------
