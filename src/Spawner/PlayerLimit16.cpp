@@ -710,17 +710,71 @@ DEFINE_HOOK(0x552D60, PlayerLimit16_LoadProgress_Draw, 5)
 }
 
 /*
+ * After progress surface exists (LoadProgress +0x60 set), try the stock
+ * start-marker drawer once. Early DLL showed 8 mono (orange) marks when this
+ * path ran; multi-color on 8-player maps is mostly baked into the map Preview.
+ *
+ * thiscall 0x640710(BSurface* this, void* hwndOrDc)
+ * Surfaces seen in engine: 0xAC1154, 0xABE154 – try both.
+ */
+DEFINE_HOOK(0x553687, PlayerLimit16_LoadProgress_TryStartMarks, 5)
+{
+	if (!PlayerLimit16::IsActive())
+		return 0;
+
+	EnsureStartingPoints("LoadProgress::TryStartMarks");
+
+	static bool s_tried = false;
+	if (s_tried)
+		return 0;
+	s_tried = true;
+
+	using DrawFn = void (__thiscall*)(void* self, void* arg);
+	auto draw = reinterpret_cast<DrawFn>(0x640710);
+
+	DWORD surfaces[] = {
+		*reinterpret_cast<DWORD*>(0x00AC1154),
+		*reinterpret_cast<DWORD*>(0x00ABE154),
+	};
+	for (DWORD s : surfaces)
+	{
+		if (!IsPlausiblePtr(s))
+			continue;
+		Log("[StartPts] TryStartMarks: calling 0x640710 this=%08X\n", s);
+		draw(reinterpret_cast<void*>(s), nullptr);
+	}
+	return 0;
+}
+
+/*
  * 0x6408D4 reads NumberStartingPoints then:
  *   if (num <= 0 || num > 8) skip colored start markers entirely.
  * Spawner sets num=16 for 16-player maps → no colored indicators.
  * Cap to 8 here (same moment the draw path reads the value).
  */
+/* Log every entry into the start-marker drawer (proves whether load path uses it). */
+DEFINE_HOOK(0x640710, PlayerLimit16_StartPts_DrawEntry, 6)
+{
+	if (!PlayerLimit16::IsActive())
+		return 0;
+	DWORD scen = *reinterpret_cast<DWORD*>(ADDR_MAP);
+	int num = 0;
+	if (IsPlausiblePtr(scen))
+		num = *reinterpret_cast<int*>(scen + OFF_NUM_START_POINTS);
+	Log("[StartPts] DrawEntry 0x640710 this=%08X arg=%08X NumberStartingPoints=%d\n",
+		R->ECX(), R->Stack<DWORD>(0x4), num);
+	return 0;
+}
+
 DEFINE_HOOK(0x6408D4, PlayerLimit16_StartPts_ColorDrawGuard, 6)
 {
 	if (!PlayerLimit16::IsActive())
 		return 0;
 
-	DWORD scen = R->ECX();
+	/* ECX here is ScenarioClass* (reloaded from 0xA8B230 just above) */
+	DWORD scen = *reinterpret_cast<DWORD*>(ADDR_MAP);
+	if (!IsPlausiblePtr(scen))
+		scen = R->ECX();
 	if (!IsPlausiblePtr(scen))
 		return 0;
 
