@@ -444,7 +444,19 @@ static void EnsureStartingPoints(const char* why)
 
 	Log("[StartPts] %s: NumberStartingPoints=%d HouseCount=%d\n", why, num, houseCount);
 
-	/* Already has valid starts — only log once */
+	/*
+	 * Stock StartingPoints[8] only. Spawner may set NumberStartingPoints=16;
+	 * the load minimap loop then walks past the array into HouseIndices and
+	 * either draws garbage or skips colored indicators entirely. Cap at 8.
+	 */
+	if (num > STOCK_START_SLOTS)
+	{
+		Log("[StartPts] capping NumberStartingPoints %d → %d (stock array size)\n",
+			num, STOCK_START_SLOTS);
+		*pNum = STOCK_START_SLOTS;
+		num = STOCK_START_SLOTS;
+	}
+
 	bool anyNonZero = false;
 	for (int i = 0; i < STOCK_START_SLOTS; i++)
 	{
@@ -456,8 +468,9 @@ static void EnsureStartingPoints(const char* why)
 	if (anyNonZero && num > 0)
 	{
 		if (!g_StartPtsFixed)
-			Log("[StartPts] stock slots already populated – leave alone\n");
+			Log("[StartPts] stock slots populated, NumberStartingPoints=%d\n", num);
 		g_StartPtsFixed = true;
+		/* Cap already applied above; nothing more to fill */
 		return;
 	}
 
