@@ -700,24 +700,53 @@ DEFINE_HOOK(0x5D6D02, PlayerLimit16_Waypoint_NotFoundSkip, 5)
 // Loading-screen minimap: ensure StartingPoints + colors before progress draw
 // ---------------------------------------------------------------------------
 
+static DWORD g_LoadProgressThis = 0;
+
 DEFINE_HOOK(0x552D60, PlayerLimit16_LoadProgress_Draw, 5)
 {
 	if (!PlayerLimit16::IsActive())
 		return 0;
+	g_LoadProgressThis = R->ECX();
 	EnsureStartingPoints("LoadProgress::Draw");
 	return 0;
 }
 
 /*
- * Re-clamp right before the progress surface blit (0x553687).
- * Spawner/engine often bumps NumberStartingPoints back to 16 and rewrites
- * HouseIndices to cell coords between our earlier fix and the real draw.
+ * After progress surface work (0x553687): keep tables fixed, then try the
+ * stock start-marker drawer via the global helper object at 0xAC1154 (same
+ * object used by map UI). With AllowSixteen + g_StartPts16 redirects this
+ * can paint more than 8 markers when the helper exists during load.
  */
 DEFINE_HOOK(0x553687, PlayerLimit16_LoadProgress_Reclamp, 5)
 {
 	if (!PlayerLimit16::IsActive())
 		return 0;
 	EnsureStartingPoints("LoadProgress::Reclamp");
+
+	/* Prefer the known start-marker helper object */
+	DWORD helper = *reinterpret_cast<DWORD*>(0x00AC1154);
+	if (!IsPlausiblePtr(helper))
+	{
+		Log("[StartPts] overlay: no AC1154 helper yet\n");
+		return 0;
+	}
+
+	static int s_frames = 0;
+	if (s_frames++ > 3) /* a few frames during load is enough */
+		return 0;
+
+	Log("[StartPts] overlay: call 0x640710 helper=%08X num=%d ready=%d\n",
+		helper,
+		IsPlausiblePtr(*reinterpret_cast<DWORD*>(ADDR_MAP))
+			? *reinterpret_cast<int*>(*reinterpret_cast<DWORD*>(ADDR_MAP) + OFF_NUM_START_POINTS)
+			: -1,
+		g_StartPts16Ready ? 1 : 0);
+
+	using DrawFn = void (__thiscall*)(void* self, void* hwnd);
+	auto draw = reinterpret_cast<DrawFn>(0x640710);
+	/* HWND unknown during load – pass null; drawer exits early if GetDC fails,
+	 * but some builds still render via DirectDraw path inside. */
+	draw(reinterpret_cast<void*>(helper), nullptr);
 	return 0;
 }
 
